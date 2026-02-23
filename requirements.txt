@@ -1,0 +1,32 @@
+# Web Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6  # Required for file uploads
+
+# Image Processing
+Pillow==10.1.0
+
+# OCR
+pytesseract==0.3.10
+
+# Hugging Face Transformers
+transformers==4.35.2
+torch==2.1.1
+torchvision==0.16.1
+accelerate==0.25.0
+bitsandbytes==0.41.3  # For quantization (4-bit loading)
+
+# Vector Search & Embeddings
+sentence-transformers==2.2.2
+faiss-cpu==1.7.4
+numpy==1.24.3
+
+# For your RAG system (from create_faiss.py)
+langchain==0.0.340
+langchain-community==0.0.10
+chromadb==0.4.18
+
+# Utilities
+pypdf==3.17.4  # For PDF processing
+python-dotenv==1.0.0  # For environment variables
+tiktoken==0.5.1  # For token counting
