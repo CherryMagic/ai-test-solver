@@ -8,6 +8,7 @@ import logging
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 import torch
 from create_faiss import retrieve_context, load_retriever
+from ocr import preprocess_image_for_ocr, ocr_with_preprocessing
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -21,17 +22,19 @@ app = FastAPI(title="Test Solver")
 try:
     model_name = "meta-llama/Llama-3.2-1B-Instruct"
 
+    """
     quant_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_quant_type="nf4"
     )
+    """
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         device_map="cpu",
-        quantization_config=quant_config
+        torch_dtype=torch.float32
     )
 
     logger.info("Model loaded successfully")
@@ -69,8 +72,11 @@ async def test_ocr(file: UploadFile = File(...)):
         logger.info(f"Image opened: size={image.size}, mode={image.mode}")
         
         # Perform OCR
-        ocr_text = pytesseract.image_to_string(image, lang=tess_langs).strip()
-        logger.info(f"OCR extracted {len(ocr_text)} characters")
+        ocr_text = ocr_with_preprocessing(contents, lang='srp+eng')
+        
+        if not ocr_text:
+            # Try with only Serbian if English+Serbian fails
+            ocr_text = ocr_with_preprocessing(contents, lang='srp')
         
         if not ocr_text:
             return JSONResponse(
@@ -114,9 +120,18 @@ def answer_question_rag(index, all_chunks, embedder, model,
         temperature=0.0
     )
 
-    # 5️⃣ Decode
-    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return answer.strip()
+    full_response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
+    # 🔥 EXTRACT ONLY THE ANSWER PART
+    # Method 1: Look for "Answer:" in the response
+    if "Answer:" in full_response:
+        answer = full_response.split("Answer:")[-1].strip()
+    else:
+        # Method 2: Remove the prompt from the response
+        answer = full_response.replace(prompt, "").strip()
+    
+    return answer
+
 
 @app.post("/solve-test/")
 async def solve_test(file: UploadFile = File(...)):
