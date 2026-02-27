@@ -339,7 +339,7 @@ def ocr_with_script_detection(image_bytes):
         cyrillic_whitelist = "АБВГДЂЕЖЗИЈКЛЉМНЊОПРСТЋУФХЦЧЏШабвгдђежзијклљмнњопрстћуфхцчџш0123456789.,!?;:-()_ "
         
         # Build config with whitelist
-        config = f'--oem 3 --psm 6 -c tessedit_char_whitelist="{cyrillic_whitelist}"'
+        config = f'--oem 3 --psm 1 -c tessedit_char_whitelist="{cyrillic_whitelist}"'
         
         # First pass: Get data with confidence scores
         try:
@@ -412,7 +412,7 @@ def simple_ocr(image_bytes, lang='srp+srp_latn'):
         text = pytesseract.image_to_string(
             img,
             lang=lang,
-            config='--oem 3 --psm 6'
+            config='--oem 3 --psm 1'
         )
         
         return text.strip()
@@ -456,6 +456,537 @@ def batch_ocr(image_paths, output_file="ocr_results.txt"):
     
     logger.info(f"Results saved to {output_file}")
     return results
+
+def debug_ocr_detections(image_bytes):
+    """Visualize what Tesseract detects with bounding boxes"""
+    try:
+        import cv2
+        import numpy as np
+        from PIL import Image, ImageDraw
+        from pytesseract import Output
+        
+        # Preprocess
+        processed_bytes = preprocess_for_serbian(image_bytes)
+        img = Image.open(io.BytesIO(processed_bytes))
+        
+        # Convert to OpenCV for drawing
+        img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        
+        # Get detailed OCR data
+        ocr_data = pytesseract.image_to_data(
+            img, 
+            lang='srp', 
+            config='--oem 3 --psm 1', 
+            output_type=Output.DICT
+        )
+        
+        # Create visualization
+        n_boxes = len(ocr_data['text'])
+        confidence_thresholds = [0, 30, 60, 90]
+        
+        for threshold in confidence_thresholds:
+            vis_img = img_cv.copy()
+            high_conf_count = 0
+            
+            for i in range(n_boxes):
+                conf = int(ocr_data['conf'][i])
+                text = ocr_data['text'][i].strip()
+                
+                if conf > threshold and text:
+                    high_conf_count += 1
+                    (x, y, w, h) = (ocr_data['left'][i], ocr_data['top'][i], 
+                                   ocr_data['width'][i], ocr_data['height'][i])
+                    
+                    # Color by confidence
+                    if conf > 90:
+                        color = (0, 255, 0)  # Green - high
+                    elif conf > 60:
+                        color = (255, 255, 0)  # Yellow - medium
+                    else:
+                        color = (0, 255, 255)  # Cyan - low
+                    
+                    cv2.rectangle(vis_img, (x, y), (x + w, y + h), color, 2)
+                    cv2.putText(vis_img, f"{conf}", (x, y-5), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
+            
+            # Save visualization
+            output_path = f"ocr_detections_conf_{threshold}.png"
+            cv2.imwrite(output_path, vis_img)
+            print(f"✅ Saved: {output_path} with {high_conf_count} detections above {threshold} confidence")
+        
+        # Also save text with confidence
+        with open("ocr_debug_output.txt", "w", encoding="utf-8") as f:
+            for i in range(n_boxes):
+                conf = ocr_data['conf'][i]
+                text = ocr_data['text'][i]
+                if text.strip():
+                    f.write(f"Conf: {conf:5s} | Text: {text}\n")
+        
+        print("✅ Saved detailed debug to ocr_debug_output.txt")
+        
+    except Exception as e:
+        print(f"Debug error: {e}")
+
+
+def ocr_confidence_only(image_bytes, min_confidence=60):
+    """OCR with ONLY confidence filtering, no character restrictions"""
+    try:
+        processed_bytes = preprocess_for_serbian(image_bytes)
+        img = Image.open(io.BytesIO(processed_bytes))
+        
+        from pytesseract import Output
+        ocr_data = pytesseract.image_to_data(
+            img, 
+            lang='srp', 
+            config='--oem 3 --psm 1',  # NO whitelist
+            output_type=Output.DICT
+        )
+        
+        words = []
+        for i, conf in enumerate(ocr_data['conf']):
+            if conf == '-1':
+                continue
+                
+            conf_val = int(conf)
+            text = ocr_data['text'][i].strip()
+            
+            if conf_val >= min_confidence and text:
+                words.append(text)
+        
+        print(f"✅ Confidence-only: {len(words)} words")
+        return ' '.join(words).strip()
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        return ""
+
+
+def ocr_with_confidence_filter(image_bytes, min_confidence=60, min_word_length=2):
+    """OCR that only returns text with confidence >= threshold"""
+    try:
+        # Preprocess image
+        processed_bytes = preprocess_for_serbian(image_bytes)
+        img = Image.open(io.BytesIO(processed_bytes))
+        
+        # Strict Serbian Cyrillic whitelist
+        whitelist = "АБВГДЂЕЖЗИЈКЛЉМНЊОПРСТЋУФХЦЧЏШ" + \
+                    "абвгдђежзијклљмнњопрстћуфхцчџш" + \
+                    "0123456789" + \
+                    ".,!?;:-() " + \
+                    "[]{}|\\/\"'`~@#$%^&*_+="  # Add common OCR garbage temporarily
+        config = f'--oem 3 --psm 1 -c tessedit_char_whitelist="{whitelist}"'
+        
+        # Get detailed OCR data
+        from pytesseract import Output
+        ocr_data = pytesseract.image_to_data(
+            img, lang='srp', config=config, output_type=Output.DICT
+        )
+        
+        # Filter by confidence and word length
+        words = []
+        confs = []
+        
+        for i, conf in enumerate(ocr_data['conf']):
+            if conf == '-1':
+                continue
+                
+            conf_val = int(conf)
+            word = ocr_data['text'][i].strip()
+            
+            # Apply filters
+            if (word and 
+                conf_val >= min_confidence and 
+                len(word) >= min_word_length):
+                
+                # Optional: Check if word contains only valid chars
+                if all(c in whitelist for c in word):
+                    words.append(word)
+                    confs.append(conf_val)
+        
+        # Log stats
+        print(f"\n📊 Confidence Filter Results (min={min_confidence}%):")
+        print(f"   Words kept: {len(words)}")
+        if confs:
+            print(f"   Avg confidence: {sum(confs)/len(confs):.1f}%")
+            print(f"   Min/Max: {min(confs)}% / {max(confs)}%")
+        
+        # Show words with confidence for debugging
+        if words:
+            print("\n   Words with confidence:")
+            for word, conf in zip(words[:10], confs[:10]):  # Show first 10
+                print(f"     {conf:3d}%: {word}")
+            if len(words) > 10:
+                print(f"     ... and {len(words)-10} more")
+        
+        return ' '.join(words).strip()
+        
+    except Exception as e:
+        logger.error(f"Confidence-based OCR error: {e}")
+        return ""
+    
+
+def test_confidence_thresholds(image_bytes):
+    """Test OCR with different confidence thresholds"""
+    thresholds = [30, 40, 50, 60, 70, 80, 90]
+    results = {}
+    
+    print("\n" + "="*60)
+    print("🔬 TESTING CONFIDENCE THRESHOLDS")
+    print("="*60)
+    
+    for threshold in thresholds:
+        text = ocr_confidence_only(image_bytes, min_confidence=threshold)
+        results[threshold] = {
+            'text': text,
+            'length': len(text),
+            'words': len(text.split()) if text else 0
+        }
+        print(f"\n📌 Threshold {threshold}%: {results[threshold]['words']} words, {results[threshold]['length']} chars")
+    
+    # Save comparison
+    with open("confidence_threshold_comparison.txt", "w", encoding="utf-8") as f:
+        f.write("CONFIDENCE THRESHOLD COMPARISON\n")
+        f.write("="*60 + "\n\n")
+        
+        for threshold in thresholds:
+            f.write(f"\n{'='*40}\n")
+            f.write(f"THRESHOLD: {threshold}%\n")
+            f.write(f"Words: {results[threshold]['words']}\n")
+            f.write(f"Characters: {results[threshold]['length']}\n")
+            f.write(f"{'='*40}\n")
+            f.write(results[threshold]['text'])
+            f.write("\n\n")
+    
+    print(f"\n✅ Comparison saved to confidence_threshold_comparison.txt")
+    return results
+
+
+def ocr_with_confidence_filter_visual(image_bytes, min_confidence=60):
+    """OCR with confidence filtering AND visual output"""
+    try:
+        # Preprocess
+        processed_bytes = preprocess_for_serbian(image_bytes)
+        img = Image.open(io.BytesIO(processed_bytes))
+        
+        # Get OCR data with boxes
+        from pytesseract import Output
+        ocr_data = pytesseract.image_to_data(
+            img, 
+            lang='srp', 
+            config='--oem 3 --psm 1', 
+            output_type=Output.DICT
+        )
+        
+        # Collect all words with their boxes
+        all_words = []
+        kept_words = []
+        filtered_words = []
+        
+        n_boxes = len(ocr_data['text'])
+        for i in range(n_boxes):
+            conf = ocr_data['conf'][i]
+            if conf == '-1':
+                continue
+                
+            conf_val = int(conf)
+            text = ocr_data['text'][i].strip()
+            
+            if not text:
+                continue
+            
+            word_data = {
+                'text': text,
+                'conf': conf_val,
+                'left': ocr_data['left'][i],
+                'top': ocr_data['top'][i],
+                'width': ocr_data['width'][i],
+                'height': ocr_data['height'][i]
+            }
+            
+            all_words.append(word_data)
+            
+            if conf_val >= min_confidence and len(text) >= 2:
+                kept_words.append(word_data)
+            else:
+                filtered_words.append(word_data)
+        
+        # Draw ALL words (with different colors for kept vs filtered)
+        img_all = Image.open(io.BytesIO(processed_bytes))
+        img_cv = cv2.cvtColor(np.array(img_all), cv2.COLOR_RGB2BGR)
+        
+        # Draw filtered words in gray first
+        for w in filtered_words:
+            x, y, w_w, w_h = w['left'], w['top'], w['width'], w['height']
+            cv2.rectangle(img_cv, (x, y), (x + w_w, y + w_h), (128, 128, 128), 1)
+        
+        # Draw kept words in green
+        for w in kept_words:
+            x, y, w_w, w_h = w['left'], w['top'], w['width'], w['height']
+            cv2.rectangle(img_cv, (x, y), (x + w_w, y + w_h), (0, 255, 0), 2)
+            cv2.putText(img_cv, f"{w['text']}", (x, y-5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        
+        # Save
+        result = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+        result.save(f"confidence_filter_{min_confidence}.png")
+        
+        print(f"📊 Confidence filter ({min_confidence}%):")
+        print(f"   Total words detected: {len(all_words)}")
+        print(f"   Kept: {len(kept_words)} (green boxes)")
+        print(f"   Filtered: {len(filtered_words)} (gray boxes)")
+        print(f"✅ Saved to confidence_filter_{min_confidence}.png")
+        
+        # Return text from kept words
+        kept_text = ' '.join([w['text'] for w in kept_words])
+        return kept_text
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        return ""
+
+
+def ocr_ensemble_visual(image_bytes):
+    """Ensemble OCR with visual output showing which pass found each word"""
+    try:
+        processed_bytes = preprocess_for_serbian(image_bytes)
+        img = Image.open(io.BytesIO(processed_bytes))
+        
+        from pytesseract import Output
+        import numpy as np
+        
+        # Run multiple passes
+        passes = [
+            {'name': 'P1_High', 'conf': 60, 'psm': 1, 'color': (0, 255, 0)},  # Green
+            {'name': 'P2_Medium', 'conf': 40, 'psm': 1, 'color': (255, 255, 0)},  # Yellow
+            {'name': 'P3_Low', 'conf': 30, 'psm': 1, 'color': (0, 255, 255)},  # Cyan
+            {'name': 'P4_SingleLine', 'conf': 40, 'psm': 1, 'color': (255, 0, 255)},  # Magenta
+        ]
+        
+        # Store all detections with their source pass
+        all_detections = []
+        
+        for pass_config in passes:
+            config = f'--oem 3 --psm {pass_config["psm"]}'
+            
+            ocr_data = pytesseract.image_to_data(
+                img, lang='srp', config=config, output_type=Output.DICT
+            )
+            
+            for i, conf in enumerate(ocr_data['conf']):
+                if conf == '-1':
+                    continue
+                    
+                conf_val = int(conf)
+                text = ocr_data['text'][i].strip()
+                
+                if conf_val >= pass_config['conf'] and text and len(text) >= 2:
+                    all_detections.append({
+                        'text': text,
+                        'conf': conf_val,
+                        'left': ocr_data['left'][i],
+                        'top': ocr_data['top'][i],
+                        'width': ocr_data['width'][i],
+                        'height': ocr_data['height'][i],
+                        'pass': pass_config['name'],
+                        'color': pass_config['color']
+                    })
+        
+        # Remove near-duplicates (same area)
+        unique_detections = []
+        for det in all_detections:
+            # Check if similar detection already exists
+            is_duplicate = False
+            for existing in unique_detections:
+                # If boxes overlap significantly
+                if (abs(det['left'] - existing['left']) < 20 and
+                    abs(det['top'] - existing['top']) < 20):
+                    is_duplicate = True
+                    # Keep the one with higher confidence
+                    if det['conf'] > existing['conf']:
+                        unique_detections.remove(existing)
+                        unique_detections.append(det)
+                    break
+            
+            if not is_duplicate:
+                unique_detections.append(det)
+        
+        # Draw
+        img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        
+        # Draw each detection with its pass color
+        for det in unique_detections:
+            x, y, w, h = det['left'], det['top'], det['width'], det['height']
+            color = det['color']
+            
+            cv2.rectangle(img_cv, (x, y), (x + w, y + h), color, 2)
+            cv2.putText(img_cv, f"{det['pass']}", (x, y-5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
+        
+        # Save
+        result = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+        result.save("ensemble_result.png")
+        
+        # Count by pass
+        from collections import Counter
+        pass_counts = Counter([d['pass'] for d in unique_detections])
+        
+        print(f"📊 Ensemble Results:")
+        for pass_name, count in pass_counts.items():
+            print(f"   {pass_name}: {count} words")
+        print(f"   Total unique: {len(unique_detections)}")
+        print(f"✅ Saved to ensemble_result.png")
+        
+        # Sort by position and return text
+        unique_detections.sort(key=lambda x: (x['top'], x['left']))
+        return ' '.join([d['text'] for d in unique_detections])
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        return ""
+    
+
+def ocr_two_pass_visual(image_bytes):
+    """Two-pass OCR with visual output"""
+    try:
+        processed_bytes = preprocess_for_serbian(image_bytes)
+        img = Image.open(io.BytesIO(processed_bytes))
+        
+        from pytesseract import Output
+        
+        # Get all OCR data
+        ocr_data = pytesseract.image_to_data(
+            img, lang='srp', config='--oem 3 --psm 1', output_type=Output.DICT
+        )
+        
+        # Collect all boxes
+        all_boxes = []
+        for i, conf in enumerate(ocr_data['conf']):
+            if conf == '-1':
+                continue
+                
+            text = ocr_data['text'][i].strip()
+            if not text:
+                continue
+                
+            all_boxes.append({
+                'text': text,
+                'conf': int(conf),
+                'left': ocr_data['left'][i],
+                'top': ocr_data['top'][i],
+                'width': ocr_data['width'][i],
+                'height': ocr_data['height'][i]
+            })
+        
+        # Pass 1: High confidence words
+        high_conf = [b for b in all_boxes if b['conf'] >= 60 and len(b['text']) >= 2]
+        
+        # Pass 2: Medium confidence near high confidence
+        medium_conf = []
+        for box in all_boxes:
+            if 40 <= box['conf'] < 60 and len(box['text']) >= 2:
+                # Check if near any high confidence word
+                for hc in high_conf:
+                    # Vertical proximity
+                    if abs(box['top'] - hc['top']) < 50:
+                        medium_conf.append(box)
+                        break
+        
+        # Draw
+        img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        
+        # Draw all other words in gray
+        kept_indices = set([id(b) for b in high_conf + medium_conf])
+        for box in all_boxes:
+            if id(box) not in kept_indices:
+                x, y, w, h = box['left'], box['top'], box['width'], box['height']
+                cv2.rectangle(img_cv, (x, y), (x + w, y + h), (128, 128, 128), 1)
+        
+        # Draw medium confidence in yellow
+        for box in medium_conf:
+            x, y, w, h = box['left'], box['top'], box['width'], box['height']
+            cv2.rectangle(img_cv, (x, y), (x + w, y + h), (255, 255, 0), 2)
+            cv2.putText(img_cv, f"{box['text']}", (x, y-5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+        
+        # Draw high confidence in green
+        for box in high_conf:
+            x, y, w, h = box['left'], box['top'], box['width'], box['height']
+            cv2.rectangle(img_cv, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cv2.putText(img_cv, f"{box['text']}", (x, y-5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        
+        # Save
+        result = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+        result.save("two_pass_result.png")
+        
+        print(f"📊 Two-Pass Results:")
+        print(f"   High confidence (green): {len(high_conf)}")
+        print(f"   Medium confidence near text (yellow): {len(medium_conf)}")
+        print(f"   Filtered (gray): {len(all_boxes) - len(high_conf) - len(medium_conf)}")
+        print(f"✅ Saved to two_pass_result.png")
+        
+        # Return combined text
+        all_kept = high_conf + medium_conf
+        all_kept.sort(key=lambda x: (x['top'], x['left']))  # Sort by position
+        return ' '.join([b['text'] for b in all_kept])
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        return ""
+
+
+def draw_word_boxes(image_bytes, words_with_boxes, output_path="ocr_boxes.png", title="OCR Results"):
+    """Draw bounding boxes around detected words"""
+    try:
+        import cv2
+        import numpy as np
+        from PIL import Image, ImageDraw, ImageFont
+        
+        # Open original image
+        img = Image.open(io.BytesIO(image_bytes))
+        
+        # Convert to RGB if needed
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        # Convert to OpenCV for drawing
+        img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        
+        # Draw boxes for each word
+        for item in words_with_boxes:
+            word = item['text']
+            conf = item.get('conf', 0)
+            x, y, w, h = item['left'], item['top'], item['width'], item['height']
+            
+            # Color based on confidence
+            if conf >= 60:
+                color = (0, 255, 0)  # Green - high confidence
+            elif conf >= 40:
+                color = (255, 255, 0)  # Yellow - medium
+            else:
+                color = (0, 255, 255)  # Cyan - low
+            
+            # Draw rectangle
+            cv2.rectangle(img_cv, (x, y), (x + w, y + h), color, 2)
+            
+            # Add word text above box
+            cv2.putText(img_cv, f"{word}", (x, y-5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            
+            # Add confidence
+            cv2.putText(img_cv, f"{conf}%", (x, y-20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
+        
+        # Convert back to PIL and save
+        result = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+        result.save(output_path)
+        print(f"✅ Boxed image saved to: {output_path}")
+        
+        return result
+        
+    except Exception as e:
+        print(f"Error drawing boxes: {e}")
+        return None
 
 import time
 
@@ -508,6 +1039,11 @@ if __name__ == "__main__":
     
     print(f"\n📸 Testing on: {image_path}")
     print(f"File size: {len(img_bytes)} bytes")
+
+     # ===== ADD THIS LINE HERE =====
+    # Run diagnostic first
+    print("\n🔍 Running OCR diagnostic...")
+    debug_ocr_detections(img_bytes)
     
     # Ask user what to do
     print("\n" + "="*60)
@@ -517,6 +1053,14 @@ if __name__ == "__main__":
     print("3. Compare original vs preprocessed")
     print("4. Inspect all preprocessing steps")
     print("5. Run everything")
+    # Add option for confidence-based OCR
+    print("7. Test confidence thresholds")
+    print("8. Run confidence-based OCR (60%)")
+    print("🎯 RECALL IMPROVEMENT OPTIONS")
+    print("="*60)
+    print("9. Test recall strategies")
+    print("10. Run two-pass OCR")
+    print("11. Run ensemble OCR")
     print("="*60)
     
     choice = input("Enter choice (1-5): ").strip()
@@ -558,7 +1102,7 @@ if __name__ == "__main__":
         print("\n📄 BASIC OCR:")
         start = time.time()
         img = Image.open(io.BytesIO(img_bytes))
-        basic_text = pytesseract.image_to_string(img, lang='srp+eng', config='--oem 3 --psm 6')
+        basic_text = pytesseract.image_to_string(img, lang='srp+eng', config='--oem 3 --psm 1')
         print(f"Time: {time.time()-start:.2f}s")
         print(f"Chars: {len(basic_text)}")
         print(f"Preview: {basic_text[:200]}")
@@ -629,5 +1173,33 @@ if __name__ == "__main__":
                 f.write("\n\n")
         
         print(f"✅ All results saved to: ocr_results_all.txt")
+    
+    if choice == '7':
+        test_confidence_thresholds(img_bytes)
+    
+    if choice == '8':
+        text = ocr_confidence_only(img_bytes, min_confidence=60)
+        print(f"\n📝 Result ({len(text)} chars):")
+        print(text)
+        
+        # Save to file
+        with open("confidence_60_result.txt", "w", encoding="utf-8") as f:
+            f.write(text)
+        print("✅ Saved to confidence_60_result.txt")
+    
+    if choice == '9':
+        text = ocr_with_confidence_filter_visual(img_bytes, min_confidence=60)
+        with open("visual_confidence_60.txt", "w", encoding="utf-8") as f:
+            f.write(text)
+
+    if choice == '10':
+        text = ocr_two_pass_visual(img_bytes)
+        with open("visual_two_pass.txt", "w", encoding="utf-8") as f:
+            f.write(text)
+
+    if choice == '11':
+        text = ocr_ensemble_visual(img_bytes)
+        with open("ensemble_result.txt", "w", encoding="utf-8") as f:
+            f.write(text)
     
     print("\n✅ Done! Check the generated images to see what's happening.")
