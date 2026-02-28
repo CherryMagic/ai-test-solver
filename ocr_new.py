@@ -38,6 +38,9 @@ tempfile.tempdir = custom_temp
 print(f"📂 Using temp directory: {custom_temp}")
 
 
+UNDERLINE_CHAR = '▁' 
+
+
 class EmptyLineDetector:
     """Detects empty lines and blank answer spaces in images"""
     
@@ -158,7 +161,7 @@ class EmptyLineDetector:
         
         return circle_list
     
-    def detect_underlines(self, img_array):
+    def detect_underlines_as_characters(self, img_array):
         """
         Detect underline lines
         Returns: list of (x1, y1, x2, y2) for underlines
@@ -182,16 +185,33 @@ class EmptyLineDetector:
             maxLineGap=5
         )
         
-        underline_list = []
+        underline_chars = []
         if lines is not None:
             for line in lines:
                 x1, y1, x2, y2 = line[0]
                 # Check if line is roughly horizontal
                 angle = abs(np.arctan2(y2-y1, x2-x1) * 180 / np.pi)
                 if angle < 20:  # Nearly horizontal
-                    underline_list.append((x1, y1, x2, y2))
+                    # Create a bounding box around the line
+                    x = min(x1, x2)
+                    y = min(y1, y2) - 5  # Extend upward slightly
+                    w = abs(x2 - x1)
+                    h = 10  # Fixed height for underline character
+                    
+                    # Split long underlines into multiple characters
+                    # (each underline character will be about 30-50 pixels wide)
+                    char_width = 40
+                    if w > char_width:
+                        num_chars = w // char_width
+                        for i in range(num_chars):
+                            char_x = x + i * char_width
+                            char_w = min(char_width, w - i * char_width)
+                            if char_w > 20:  # Minimum width to count
+                                underline_chars.append((char_x, y, char_w, h, '▁'))
+                    else:
+                        underline_chars.append((x, y, w, h, '▁'))
         
-        return underline_list
+        return underline_chars
 
 
 
@@ -262,64 +282,6 @@ def auto_rotate_image(image):
         print(f"Rotation error: {e}")
         return image
 
-def auto_rotate_image(image_bytes):
-    """Automatically detect and correct image rotation"""
-    try:
-        import cv2
-        import numpy as np
-        from PIL import Image
-        
-        # Open image
-        pil_image = Image.open(io.BytesIO(image_bytes))
-        
-        # Convert to OpenCV
-        open_cv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-        gray = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2GRAY)
-        
-        # Detect edges
-        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-        
-        # Detect lines using Hough transform
-        lines = cv2.HoughLines(edges, 1, np.pi/180, 100)
-        
-        if lines is not None:
-            angles = []
-            for line in lines:
-                theta = line[0][1]
-                # Convert to degrees
-                angle = theta * 180 / np.pi - 90
-                angles.append(angle)
-            
-            if angles:
-                # Find median angle
-                median_angle = np.median(angles)
-                
-                # Only rotate if significant
-                if abs(median_angle) > 1:
-                    print(f"🔄 Rotating by {median_angle:.1f} degrees")
-                    # Rotate image
-                    (h, w) = open_cv_image.shape[:2]
-                    center = (w // 2, h // 2)
-                    M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
-                    rotated = cv2.warpAffine(open_cv_image, M, (w, h), 
-                                             flags=cv2.INTER_CUBIC,
-                                             borderMode=cv2.BORDER_REPLICATE)
-                    
-                    # Convert back to PIL
-                    result = Image.fromarray(cv2.cvtColor(rotated, cv2.COLOR_BGR2RGB))
-                    
-                    output = io.BytesIO()
-                    result.save(output, format='PNG')
-                    output.seek(0)
-                    return output.getvalue()
-        
-        # If no lines detected or no rotation needed
-        return image_bytes
-        
-    except Exception as e:
-        print(f"Auto-rotate error: {e}")
-        return image_bytes
-
 
 def preprocess_image(image_bytes):
     """Light-preserving preprocessing with auto-rotation"""
@@ -335,12 +297,12 @@ def preprocess_image(image_bytes):
         
         # STEP 0: AUTO-ROTATION
         print("\n🔄 Checking orientation...")
-        pil_image = auto_rotate_image(pil_image)
+        # pil_image = auto_rotate_image(pil_image)
         
         # Check if image is landscape (wider than tall)
         if pil_image.width > pil_image.height:
             print("🔄 Image is landscape, rotating to portrait")
-            #pil_image = pil_image.rotate(-90, expand=True)
+            pil_image = pil_image.rotate(-90, expand=True)
         
         print(f"   After rotation: {pil_image.size}")
         
@@ -396,9 +358,8 @@ def preprocess_image(image_bytes):
 
 def ocr_with_boxes(image_bytes, lang='srp', psm=1):
     """
-    OCR with visual boxes showing:
-    - Character-level boxes (blue)
-    - Word-level boxes (green/yellow/orange by confidence)
+    OCR with natural underscore detection (no whitelist)
+    Returns: text with proper spacing and underscores
     """
     try:
         # Step 1: Preprocess (with auto-rotation)
@@ -410,111 +371,75 @@ def ocr_with_boxes(image_bytes, lang='srp', psm=1):
         img.save("preprocessed.png")
         print("✅ Preprocessed image saved to: preprocessed.png")
         
-        detector = EmptyLineDetector()
-
-        # Step 2: Get character-level boxes
-        print(f"\n🔍 Running OCR with PSM {psm}...")
-        
-        # Get character boxes (might fail, but we'll try)
-        char_data = None
-        try:
-            char_data = pytesseract.image_to_boxes(img, lang=lang, config=f'--psm {psm}')
-            print("✅ Character-level data retrieved")
-        except Exception as e:
-            print(f"⚠️ Character boxes failed: {e}")
-        
-        # Get word data with confidence
+        # ===== OCR WITHOUT WHITELIST =====
         from pytesseract import Output
+        
+        # Simple config - no whitelist, just PSM
+        custom_config = f'--psm {psm}'
+        
+        print(f"\n🔍 Running OCR with PSM {psm} (no whitelist)...")
+        
+        # Get word data with confidence and positions
         word_data = pytesseract.image_to_data(
             img, 
             lang=lang, 
-            config=f'--psm {psm}', 
+            config=custom_config, 
             output_type=Output.DICT
         )
         
-        # Get full text
-        full_text = pytesseract.image_to_string(img, lang=lang, config=f'--psm {psm}')
+        # Get full text for comparison
+        full_text = pytesseract.image_to_string(img, lang=lang, config=custom_config)
+        print(f"\n📝 Raw Tesseract output:\n{full_text}")
         
-        # Step 3: Create visualization
-        # Convert PIL to OpenCV for drawing
+        # Build properly spaced text with positions
+        words_with_pos = []
+        
+        for i, text in enumerate(word_data['text']):
+            conf = word_data['conf'][i]
+            if conf != '-1' and text.strip():
+                words_with_pos.append({
+                    'text': text.strip(),
+                    'conf': int(conf),
+                    'x': word_data['left'][i],
+                    'y': word_data['top'][i]
+                })
+        
+        # Sort by vertical (y) then horizontal (x)
+        words_with_pos.sort(key=lambda w: (w['y'], w['x']))
+        
+        # Group into lines
+        lines = []
+        current_line = []
+        last_y = None
+        y_threshold = 15  # Adjust based on your image
+        
+        for w in words_with_pos:
+            if last_y is None or abs(w['y'] - last_y) <= y_threshold:
+                current_line.append(w)
+            else:
+                # Sort current line by x and join with spaces
+                current_line.sort(key=lambda w: w['x'])
+                line_text = ' '.join([w['text'] for w in current_line])
+                lines.append(line_text)
+                current_line = [w]
+            last_y = w['y']
+        
+        # Add last line
+        if current_line:
+            current_line.sort(key=lambda w: w['x'])
+            line_text = ' '.join([w['text'] for w in current_line])
+            lines.append(line_text)
+        
+        # Final text with proper spacing
+        final_text = '\n'.join(lines)
+        
+        # Create visualization with boxes
         img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        h_img, w_img = img_cv.shape[:2]
-
-        empty_lines, hor_proj = detector.detect_empty_lines(img_cv)
-        
-        # Step 4: Detect answer blanks (_____)
-        print("\n📝 Detecting answer blanks...")
-        blanks = detector.detect_answer_blanks(img_cv)
-        print(f"   Found {len(blanks)} blank answer spaces")
-        
-        # Step 5: Detect circles (multiple choice)
-        print("\n⭕ Detecting circles...")
-        circles = detector.detect_multiple_choice_circles(img_cv)
-        print(f"   Found {len(circles)} circles")
-        
-        # Step 6: Detect underlines
-        print("\n📉 Detecting underlines...")
-        underlines = detector.detect_underlines(img_cv)
-        print(f"   Found {len(underlines)} underlines")
-
-
-        for start_y, end_y in empty_lines:
-            cv2.rectangle(img_cv, (0, start_y), (w_img, end_y), (0, 0, 255), 2)
-            cv2.putText(img_cv, "EMPTY LINE", (10, start_y + 20), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-        
-        # Draw answer blanks (purple boxes)
-        for x, y, w, h in blanks:
-            cv2.rectangle(img_cv, (x, y), (x + w, y + h), (255, 0, 255), 2)
-            cv2.putText(img_cv, "BLANK", (x, y-5), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
-        
-        # Draw circles (cyan circles)
-        for x, y, r in circles:
-            cv2.circle(img_cv, (x, y), r, (255, 255, 0), 2)
-            cv2.putText(img_cv, "CIRCLE", (x-20, y-r-5), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-        
-        # Draw underlines (pink lines)
-        for x1, y1, x2, y2 in underlines:
-            cv2.line(img_cv, (x1, y1), (x2, y2), (255, 0, 255), 2)
-            cv2.putText(img_cv, "UNDERLINE", (x1, y1-5), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
-
-
-        # Draw character boxes if available (blue)
-        if char_data:
-            print("\n📦 Drawing character boxes...")
-            char_count = 0
-            for line in char_data.splitlines():
-                parts = line.split()
-                if len(parts) >= 6:
-                    char = parts[0]
-                    x1 = int(parts[1])
-                    y1 = h_img - int(parts[2])  # Tesseract coordinates are from bottom
-                    x2 = int(parts[3])
-                    y2 = h_img - int(parts[4])
-                    
-                    # Draw blue box for each character
-                    cv2.rectangle(img_cv, (x1, y1), (x2, y2), (255, 0, 0), 1)
-                    char_count += 1
-                    
-                    # Put character (commented to reduce clutter)
-                    # if len(char) == 1 and char.isalpha():
-                    #     cv2.putText(img_cv, char, (x1, y1-2), 
-                    #                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 0, 0), 1)
-            
-            print(f"   Total character boxes: {char_count}")
         
         # Draw word boxes with confidence
         print("\n📦 Drawing word boxes...")
         word_count = 0
-        high_conf_words = []
-        medium_conf_words = []
-        low_conf_words = []
-        
-        # Store words by confidence for statistics
-        all_words = []
+        underscore_words = []
         
         for i, text in enumerate(word_data['text']):
             conf = word_data['conf'][i]
@@ -527,18 +452,19 @@ def ocr_with_boxes(image_bytes, lang='srp', psm=1):
                 h = word_data['height'][i]
                 
                 word_count += 1
-                all_words.append((word, conf_val))
                 
-                # Color based on confidence
-                if conf_val >= 60:
-                    color = (0, 255, 0)  # Green - high confidence
-                    high_conf_words.append(word)
-                elif conf_val >= 30:
-                    color = (0, 255, 255)  # Yellow - medium confidence
-                    medium_conf_words.append(word)
+                # Check if word contains underscore
+                if '_' in word:
+                    underscore_words.append(word)
+                    color = (255, 0, 255)  # Purple for words with underscore
                 else:
-                    color = (0, 165, 255)  # Orange - low confidence
-                    low_conf_words.append(word)
+                    # Color based on confidence
+                    if conf_val >= 60:
+                        color = (0, 255, 0)  # Green
+                    elif conf_val >= 30:
+                        color = (0, 255, 255)  # Yellow
+                    else:
+                        color = (0, 165, 255)  # Orange
                 
                 # Draw word box
                 cv2.rectangle(img_cv, (x, y), (x + w, y + h), color, 2)
@@ -547,66 +473,51 @@ def ocr_with_boxes(image_bytes, lang='srp', psm=1):
                 cv2.putText(img_cv, f"{conf_val}%", (x, y-5), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
                 
-                # Draw approximate character divisions
-                if len(word) > 1:
-                    char_width = w // max(1, len(word))
-                    for j in range(1, len(word)):
-                        char_x = x + j * char_width
-                        cv2.line(img_cv, (char_x, y), (char_x, y + h), (255, 0, 0), 1)
+                # If underscore word, mark it
+                if '_' in word:
+                    cv2.putText(img_cv, "HAS_UNDERSCORE", (x, y-20), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 0, 255), 1)
         
         print(f"   Total word boxes: {word_count}")
-        print(f"   High confidence (≥60%): {len(high_conf_words)}")
-        print(f"   Medium confidence (30-60%): {len(medium_conf_words)}")
-        print(f"   Low confidence (<30%): {len(low_conf_words)}")
+        print(f"   Words with underscores: {len(underscore_words)}")
+        if underscore_words:
+            print(f"   Examples: {underscore_words[:5]}")
         
-        # Calculate average confidence
-        conf_values = [c for _, c in all_words if c > 0]
-        if conf_values:
-            avg_conf = sum(conf_values) / len(conf_values)
-            print(f"   Average confidence: {avg_conf:.1f}%")
-        
-         # Add legend
+        # Add legend
         y_pos = 30
-        legend_items = [
-            ("BLUE: Character boxes / divisions", (255, 0, 0)),
-            ("GREEN: Word (≥60% conf)", (0, 255, 0)),
-            ("YELLOW: Word (30-60% conf)", (0, 255, 255)),
-            ("ORANGE: Word (<30% conf)", (0, 165, 255)),
-            ("RED: Empty line", (0, 0, 255)),
-            ("PURPLE: Blank answer", (255, 0, 255)),
-            ("CYAN: Circle", (255, 255, 0)),
-            ("PINK: Underline", (255, 0, 255)),
-        ]
+        cv2.putText(img_cv, "GREEN: Word (≥60% conf)", (10, y_pos), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        cv2.putText(img_cv, "YELLOW: Word (30-60% conf)", (10, y_pos+20), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        cv2.putText(img_cv, "ORANGE: Word (<30% conf)", (10, y_pos+40), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+        cv2.putText(img_cv, "PURPLE: Word contains underscore '_'", (10, y_pos+60), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
         
-        for text, color in legend_items:
-            cv2.putText(img_cv, text, (10, y_pos), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            y_pos += 20
-
         # Save visualization
-        cv2.imwrite("ocr_boxes_psm1.png", img_cv)
-        print("\n✅ Saved visualization to: ocr_boxes_psm1.png")
+        cv2.imwrite("ocr_boxes_underscore.png", img_cv)
+        print("\n✅ Saved visualization to: ocr_boxes_underscore.png")
         
-        # Add empty line markers to text output
-        text_with_markers = full_text
-        if empty_lines:
-            text_with_markers += "\n\n[EMPTY LINES DETECTED AT POSITIONS: " + ", ".join([f"{s}-{e}" for s, e in empty_lines]) + "]"
+        # Show sample with underscores
+        print(f"\n📝 Sample text with underscores:")
+        for line in lines[:5]:  # Show first 5 lines
+            if '_' in line:
+                print(f"   🔍 {line}")
+            else:
+                print(f"      {line}")
         
-        if blanks:
-            text_with_markers += "\n[BLANK ANSWER SPACES DETECTED: " + str(len(blanks)) + "]"
+        # Count underscores in final text
+        total_underscores = final_text.count('_')
+        print(f"\n📊 Total underscores in text: {total_underscores}")
         
-        return text_with_markers, word_data, {
-            'empty_lines': empty_lines,
-            'blanks': blanks,
-            'circles': circles,
-            'underlines': underlines
-        }
+        return final_text, word_data
         
     except Exception as e:
         print(f"Error in OCR: {e}")
         import traceback
         traceback.print_exc()
         return "", None
+    
 
 def test_ocr(image_path):
     """Main test function"""
@@ -628,7 +539,7 @@ def test_ocr(image_path):
     print(f"   Size: {len(img_bytes)} bytes")
     
     # Run OCR with boxes
-    text, word_data, structure_data = ocr_with_boxes(
+    text, word_data = ocr_with_boxes(
         img_bytes, 
         lang='srp', 
         psm=1
@@ -646,10 +557,6 @@ def test_ocr(image_path):
     print(f"Total characters: {len(text)}")
     print(f"Total words: {len(text.split())}")
     print(f"Total lines: {len(text.splitlines())}")
-    print(f"Empty lines detected: {len(structure_data.get('empty_lines', []))}")
-    print(f"Blank spaces detected: {len(structure_data.get('blanks', []))}")
-    print(f"Circles detected: {len(structure_data.get('circles', []))}")
-    print(f"Underlines detected: {len(structure_data.get('underlines', []))}")
 
     # Save text to file
     output_txt = "ocr_result.txt"
@@ -663,10 +570,6 @@ def test_ocr(image_path):
         f.write("\n\n" + "="*60 + "\n")
         f.write("DOCUMENT STRUCTURE\n")
         f.write("="*60 + "\n")
-        f.write(f"Empty lines: {len(structure_data.get('empty_lines', []))}\n")
-        f.write(f"Blank spaces: {len(structure_data.get('blanks', []))}\n")
-        f.write(f"Circles: {len(structure_data.get('circles', []))}\n")
-        f.write(f"Underlines: {len(structure_data.get('underlines', []))}\n")
     
     print(f"\n💾 Text saved to: {output_txt}")
     
@@ -697,6 +600,7 @@ def test_ocr(image_path):
                             low += 1
             f.write(f"\nSummary: High={high}, Medium={medium}, Low={low}\n")
     
+
     print(f"💾 Debug info saved to: {debug_txt}")
     
     print("\n✅ Generated files:")
@@ -712,7 +616,7 @@ if __name__ == "__main__":
     import os
     
     # Default test image - CHANGE THIS TO YOUR IMAGE
-    image_path = r"C:\Users\cerim\ai-test-solver\data\pid_3.jpg"
+    image_path = r"C:\Users\cerim\ai-test-solver\data\pid_1.jpg"
     
     # If default not found, look for any image in data folder
     if not os.path.exists(image_path):
