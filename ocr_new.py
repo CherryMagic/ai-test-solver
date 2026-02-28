@@ -37,6 +37,164 @@ os.makedirs(custom_temp, exist_ok=True)
 tempfile.tempdir = custom_temp
 print(f"📂 Using temp directory: {custom_temp}")
 
+
+class EmptyLineDetector:
+    """Detects empty lines and blank answer spaces in images"""
+    
+    def __init__(self):
+        self.line_height_threshold = 15  # Minimum height for a line of text
+        self.empty_space_ratio = 0.9     # If 90% of a row is white, consider it empty
+        self.min_blank_width = 30         # Minimum width for a blank answer space
+        self.min_blank_height = 10        # Minimum height for a blank answer space
+        
+    def detect_empty_lines(self, img_array, visualize=True):
+        """
+        Detect empty lines in an image using horizontal projection
+        Returns: list of (y_start, y_end) for empty lines
+        """
+        # Convert to grayscale if needed
+        if len(img_array.shape) == 3:
+            gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img_array
+        
+        # Binarize (0 = black, 255 = white)
+        _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+        
+        # Calculate horizontal projection (sum of black pixels per row)
+        # Black pixels (text) have value 0, so we invert
+        inverted = 255 - binary
+        horizontal_projection = np.sum(inverted, axis=1) / inverted.shape[1]
+        
+        # Normalize
+        max_proj = np.max(horizontal_projection)
+        if max_proj > 0:
+            horizontal_projection = horizontal_projection / max_proj
+        
+        # Find empty regions (where projection is below threshold)
+        empty_threshold = 0.05  # Less than 5% of max text density
+        is_empty = horizontal_projection < empty_threshold
+        
+        # Group consecutive empty rows into lines
+        empty_lines = []
+        in_empty = False
+        start_row = 0
+        
+        for i, empty in enumerate(is_empty):
+            if empty and not in_empty:
+                # Start of empty region
+                in_empty = True
+                start_row = i
+            elif not empty and in_empty:
+                # End of empty region
+                in_empty = False
+                if i - start_row >= self.line_height_threshold:
+                    empty_lines.append((start_row, i))
+        
+        # Check end of image
+        if in_empty and len(is_empty) - start_row >= self.line_height_threshold:
+            empty_lines.append((start_row, len(is_empty)))
+        
+        return empty_lines, horizontal_projection
+    
+    def detect_answer_blanks(self, img_array):
+        """
+        Detect blank answer spaces (_____ style) using contour detection
+        Returns: list of (x, y, w, h) for blank spaces
+        """
+        # Convert to grayscale if needed
+        if len(img_array.shape) == 3:
+            gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img_array
+        
+        # Threshold to find dark areas (underscores are dark)
+        _, binary = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
+        
+        # Find contours
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        blanks = []
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            
+            # Filter for underscore-like shapes: wide and short
+            if (w > self.min_blank_width and 
+                h < self.min_blank_height * 3 and
+                h > self.min_blank_height / 2 and
+                w > h * 3):  # At least 3x wider than tall
+                blanks.append((x, y, w, h))
+        
+        return blanks
+    
+    def detect_multiple_choice_circles(self, img_array):
+        """
+        Detect circles for multiple choice questions
+        Returns: list of (x, y, r) for circles
+        """
+        # Convert to grayscale if needed
+        if len(img_array.shape) == 3:
+            gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img_array
+        
+        # Detect circles using Hough Circle Transform
+        circles = cv2.HoughCircles(
+            gray, 
+            cv2.HOUGH_GRADIENT, 
+            dp=1, 
+            minDist=20,
+            param1=50, 
+            param2=30, 
+            minRadius=5, 
+            maxRadius=30
+        )
+        
+        circle_list = []
+        if circles is not None:
+            circles = np.round(circles[0, :]).astype("int")
+            for (x, y, r) in circles:
+                circle_list.append((x, y, r))
+        
+        return circle_list
+    
+    def detect_underlines(self, img_array):
+        """
+        Detect underline lines
+        Returns: list of (x1, y1, x2, y2) for underlines
+        """
+        # Convert to grayscale if needed
+        if len(img_array.shape) == 3:
+            gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img_array
+        
+        # Edge detection
+        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+        
+        # Detect lines
+        lines = cv2.HoughLinesP(
+            edges, 
+            rho=1, 
+            theta=np.pi/180, 
+            threshold=50,
+            minLineLength=50, 
+            maxLineGap=5
+        )
+        
+        underline_list = []
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                # Check if line is roughly horizontal
+                angle = abs(np.arctan2(y2-y1, x2-x1) * 180 / np.pi)
+                if angle < 20:  # Nearly horizontal
+                    underline_list.append((x1, y1, x2, y2))
+        
+        return underline_list
+
+
+
 def auto_rotate_image(image):
     """Detect and correct image rotation using multiple methods"""
     try:
@@ -182,7 +340,7 @@ def preprocess_image(image_bytes):
         # Check if image is landscape (wider than tall)
         if pil_image.width > pil_image.height:
             print("🔄 Image is landscape, rotating to portrait")
-            pil_image = pil_image.rotate(-90, expand=True)
+            #pil_image = pil_image.rotate(-90, expand=True)
         
         print(f"   After rotation: {pil_image.size}")
         
@@ -252,6 +410,8 @@ def ocr_with_boxes(image_bytes, lang='srp', psm=1):
         img.save("preprocessed.png")
         print("✅ Preprocessed image saved to: preprocessed.png")
         
+        detector = EmptyLineDetector()
+
         # Step 2: Get character-level boxes
         print(f"\n🔍 Running OCR with PSM {psm}...")
         
@@ -279,7 +439,49 @@ def ocr_with_boxes(image_bytes, lang='srp', psm=1):
         # Convert PIL to OpenCV for drawing
         img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
         h_img, w_img = img_cv.shape[:2]
+
+        empty_lines, hor_proj = detector.detect_empty_lines(img_cv)
         
+        # Step 4: Detect answer blanks (_____)
+        print("\n📝 Detecting answer blanks...")
+        blanks = detector.detect_answer_blanks(img_cv)
+        print(f"   Found {len(blanks)} blank answer spaces")
+        
+        # Step 5: Detect circles (multiple choice)
+        print("\n⭕ Detecting circles...")
+        circles = detector.detect_multiple_choice_circles(img_cv)
+        print(f"   Found {len(circles)} circles")
+        
+        # Step 6: Detect underlines
+        print("\n📉 Detecting underlines...")
+        underlines = detector.detect_underlines(img_cv)
+        print(f"   Found {len(underlines)} underlines")
+
+
+        for start_y, end_y in empty_lines:
+            cv2.rectangle(img_cv, (0, start_y), (w_img, end_y), (0, 0, 255), 2)
+            cv2.putText(img_cv, "EMPTY LINE", (10, start_y + 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        
+        # Draw answer blanks (purple boxes)
+        for x, y, w, h in blanks:
+            cv2.rectangle(img_cv, (x, y), (x + w, y + h), (255, 0, 255), 2)
+            cv2.putText(img_cv, "BLANK", (x, y-5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+        
+        # Draw circles (cyan circles)
+        for x, y, r in circles:
+            cv2.circle(img_cv, (x, y), r, (255, 255, 0), 2)
+            cv2.putText(img_cv, "CIRCLE", (x-20, y-r-5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+        
+        # Draw underlines (pink lines)
+        for x1, y1, x2, y2 in underlines:
+            cv2.line(img_cv, (x1, y1), (x2, y2), (255, 0, 255), 2)
+            cv2.putText(img_cv, "UNDERLINE", (x1, y1-5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+
+
         # Draw character boxes if available (blue)
         if char_data:
             print("\n📦 Drawing character boxes...")
@@ -363,21 +565,42 @@ def ocr_with_boxes(image_bytes, lang='srp', psm=1):
             avg_conf = sum(conf_values) / len(conf_values)
             print(f"   Average confidence: {avg_conf:.1f}%")
         
-        # Add legend
-        cv2.putText(img_cv, "BLUE: Character boxes / divisions", (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
-        cv2.putText(img_cv, "GREEN: Word (≥60% conf)", (10, 55), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        cv2.putText(img_cv, "YELLOW: Word (30-60% conf)", (10, 80), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-        cv2.putText(img_cv, "ORANGE: Word (<30% conf)", (10, 105), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+         # Add legend
+        y_pos = 30
+        legend_items = [
+            ("BLUE: Character boxes / divisions", (255, 0, 0)),
+            ("GREEN: Word (≥60% conf)", (0, 255, 0)),
+            ("YELLOW: Word (30-60% conf)", (0, 255, 255)),
+            ("ORANGE: Word (<30% conf)", (0, 165, 255)),
+            ("RED: Empty line", (0, 0, 255)),
+            ("PURPLE: Blank answer", (255, 0, 255)),
+            ("CYAN: Circle", (255, 255, 0)),
+            ("PINK: Underline", (255, 0, 255)),
+        ]
         
+        for text, color in legend_items:
+            cv2.putText(img_cv, text, (10, y_pos), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            y_pos += 20
+
         # Save visualization
         cv2.imwrite("ocr_boxes_psm1.png", img_cv)
         print("\n✅ Saved visualization to: ocr_boxes_psm1.png")
         
-        return full_text, word_data
+        # Add empty line markers to text output
+        text_with_markers = full_text
+        if empty_lines:
+            text_with_markers += "\n\n[EMPTY LINES DETECTED AT POSITIONS: " + ", ".join([f"{s}-{e}" for s, e in empty_lines]) + "]"
+        
+        if blanks:
+            text_with_markers += "\n[BLANK ANSWER SPACES DETECTED: " + str(len(blanks)) + "]"
+        
+        return text_with_markers, word_data, {
+            'empty_lines': empty_lines,
+            'blanks': blanks,
+            'circles': circles,
+            'underlines': underlines
+        }
         
     except Exception as e:
         print(f"Error in OCR: {e}")
@@ -405,7 +628,7 @@ def test_ocr(image_path):
     print(f"   Size: {len(img_bytes)} bytes")
     
     # Run OCR with boxes
-    text, word_data = ocr_with_boxes(
+    text, word_data, structure_data = ocr_with_boxes(
         img_bytes, 
         lang='srp', 
         psm=1
@@ -423,7 +646,11 @@ def test_ocr(image_path):
     print(f"Total characters: {len(text)}")
     print(f"Total words: {len(text.split())}")
     print(f"Total lines: {len(text.splitlines())}")
-    
+    print(f"Empty lines detected: {len(structure_data.get('empty_lines', []))}")
+    print(f"Blank spaces detected: {len(structure_data.get('blanks', []))}")
+    print(f"Circles detected: {len(structure_data.get('circles', []))}")
+    print(f"Underlines detected: {len(structure_data.get('underlines', []))}")
+
     # Save text to file
     output_txt = "ocr_result.txt"
     with open(output_txt, "w", encoding="utf-8") as f:
@@ -432,6 +659,14 @@ def test_ocr(image_path):
         f.write(f"Image: {image_path}\n")
         f.write("="*60 + "\n\n")
         f.write(text)
+
+        f.write("\n\n" + "="*60 + "\n")
+        f.write("DOCUMENT STRUCTURE\n")
+        f.write("="*60 + "\n")
+        f.write(f"Empty lines: {len(structure_data.get('empty_lines', []))}\n")
+        f.write(f"Blank spaces: {len(structure_data.get('blanks', []))}\n")
+        f.write(f"Circles: {len(structure_data.get('circles', []))}\n")
+        f.write(f"Underlines: {len(structure_data.get('underlines', []))}\n")
     
     print(f"\n💾 Text saved to: {output_txt}")
     
@@ -477,7 +712,7 @@ if __name__ == "__main__":
     import os
     
     # Default test image - CHANGE THIS TO YOUR IMAGE
-    image_path = r"C:\Users\cerim\ai-test-solver\data\srpski_1.jpg"
+    image_path = r"C:\Users\cerim\ai-test-solver\data\pid_3.jpg"
     
     # If default not found, look for any image in data folder
     if not os.path.exists(image_path):
